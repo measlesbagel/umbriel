@@ -5101,6 +5101,28 @@ static void scene_output_update_hdr_white_point_cursor(
   scene_output->hdr_white_point_cursor_locked = lock;
 }
 
+// Output commits release the previous frame's buffer to the swapchain once the flip that replaced it completes, and
+// the next frame is usually rendered straight into it. On NVIDIA 615 at 3840x2160 and 240 Hz with explicit sync, that
+// flickers a band at the bottom of the screen although the backend had already reported the buffer released; the
+// flicker is gone at 60 Hz or when the buffer stays out of the swapchain one more frame. So keep the rendered buffers
+// of the last two commits locked: it costs one swapchain slot and adds no latency.
+static void scene_output_release_retained_buffers(struct wlr_scene_output* scene_output) {
+  for (size_t i = 0; i < sizeof(scene_output->retained_buffers) / sizeof(scene_output->retained_buffers[0]); i++) {
+    if (scene_output->retained_buffers[i] != NULL) {
+      wlr_buffer_unlock(scene_output->retained_buffers[i]);
+      scene_output->retained_buffers[i] = NULL;
+    }
+  }
+}
+
+static void scene_output_retain_buffer(struct wlr_scene_output* scene_output, struct wlr_buffer* buffer) {
+  if (scene_output->retained_buffers[1] != NULL) {
+    wlr_buffer_unlock(scene_output->retained_buffers[1]);
+  }
+  scene_output->retained_buffers[1] = scene_output->retained_buffers[0];
+  scene_output->retained_buffers[0] = wlr_buffer_lock(buffer);
+}
+
 static void scene_output_handle_commit(struct wl_listener* listener, void* data) {
   struct wlr_scene_output* scene_output = wl_container_of(listener, scene_output, output_commit);
   struct wlr_output_event_commit* event = data;
@@ -5115,6 +5137,14 @@ static void scene_output_handle_commit(struct wl_listener* listener, void* data)
   // anymore
   if (state->committed & WLR_OUTPUT_STATE_BUFFER) {
     scene_output_acknowledge_damage(scene_output, state);
+    // Direct scanout commits a client buffer, which goes back to its client and is never retained.
+    if (state->buffer != NULL && state->buffer == scene_output->rendered_buffer) {
+      scene_output_retain_buffer(scene_output, state->buffer);
+    }
+  }
+  scene_output->rendered_buffer = NULL;
+  if ((state->committed & WLR_OUTPUT_STATE_ENABLED) && !state->enabled) {
+    scene_output_release_retained_buffers(scene_output);
   }
 
   bool force_update =
@@ -5299,6 +5329,7 @@ void wlr_scene_output_destroy(struct wlr_scene_output* scene_output) {
   wl_list_remove(&scene_output->output_damage.link);
   wl_list_remove(&scene_output->output_needs_frame.link);
   wl_list_remove(&scene_output->output_destroy.link);
+  scene_output_release_retained_buffers(scene_output);
   if (scene_output->in_timeline != NULL) {
     wlr_drm_syncobj_timeline_signal(scene_output->in_timeline, UINT64_MAX);
     wlr_drm_syncobj_timeline_unref(scene_output->in_timeline);
@@ -6434,6 +6465,7 @@ static bool scene_output_build_state(
     struct wlr_scene_output* scene_output, struct wlr_output_state* state,
     const struct wlr_scene_output_state_options* options
 ) {
+  scene_output->rendered_buffer = NULL;
   struct wlr_scene_output_state_options default_options = {0};
   if (!options) {
     options = &default_options;
@@ -6747,6 +6779,12 @@ static bool scene_output_build_state(
   }
 
   struct wlr_buffer* buffer = wlr_swapchain_acquire(swapchain);
+  if (buffer == NULL && scene_output->retained_buffers[0] != NULL) {
+    // Something else holds swapchain buffers too (a capture, a swapchain from another configuration): a frame
+    // that risks the flicker beats no frame.
+    scene_output_release_retained_buffers(scene_output);
+    buffer = wlr_swapchain_acquire(swapchain);
+  }
   if (buffer == NULL) {
     TRACY_MARK_FRAME;
     return false;
@@ -7065,6 +7103,7 @@ static bool scene_output_build_state(
   }
 
   wlr_output_state_set_buffer(state, buffer);
+  scene_output->rendered_buffer = buffer;
   wlr_buffer_unlock(buffer);
 
   if (scene_output->in_timeline != NULL) {

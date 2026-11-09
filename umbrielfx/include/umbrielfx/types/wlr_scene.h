@@ -422,6 +422,11 @@ struct wlr_scene_output {
     bool hdr_white_point_cursor_locked;
     struct wl_listener output_destroy;
     bool capture_exclusion_active;
+    // The swapchain buffer the latest wlr_scene_output_build_state() rendered, unlocked: only compared against the
+    // buffer of the next output commit.
+    struct wlr_buffer* rendered_buffer;
+    // The rendered buffers of the last two output commits, newest first; see scene_output_retain_buffer().
+    struct wlr_buffer* retained_buffers[2];
   } WLR_PRIVATE;
 };
 
